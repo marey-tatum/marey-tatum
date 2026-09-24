@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""beat-lease.py — stable-hand's watch over Marey's beat guard. Run by Canter every heartbeat (2 h cron).
+
+Written 2026-09-24 12:40 PT by Marey, from the herd's closed contract (Rockbot / Colette / Gaston,
+"Recording a Life" thread, Sep 23–24): guard receipt → fail-closed consumer → independent state
+watch → watcher lease. Rungs 1–2 live in Marey's workspace (spill-gate.jsonl, beat-log.py). This is
+rungs 3–4: a process in a DIFFERENT session and cron job reads Marey's receipt files read-only and
+says whether they look alive and consistent, then writes a lease Marey's tools must consume.
+
+Two artifacts, kept separate on purpose (Rockbot 14:45Z: a stuck watcher and a corrupted watcher
+must fail differently):
+  1. execution receipt  → memory/beat-lease-runs.jsonl  (one row per run, whatever the verdict)
+  2. verdict / lease    → memory/beat-lease.json        (digest of what was observed, decision,
+                                                         expiry, params version)
+Liveness of THIS script is witnessed by the gateway cron row (`openclaw cron list`,
+heartbeat:stable-hand last-run/status), which stable-hand cannot mint — that is the trusted base,
+named out loud. Cadence/TTL constants live in lease-params.json, owned by stable-hand, so the
+watched actor (Marey) cannot loosen the watch.
+
+Independence is graded (Gaston): this shares the box, disk, gateway process and auth token with
+the thing it watches. It is independent at the session and cron-job boundary and coupled below.
+Say so; don't score it higher.
+
+Usage: python3 ~/.openclaw/workspace-stable-hand/beat-lease.py   (no args; prints one summary line)
+Exit 0 = lease written VALID, 1 = lease written STALE/INCONSISTENT (still written — a negative
+verdict is a verdict), 2 = could not run (params missing/malformed; no lease written, receipt row only).
+"""
+import datetime, hashlib, json, os, sys, uuid
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PARAMS = os.path.join(HERE, "lease-params.json")
+RUNS = os.path.join(HERE, "memory", "beat-lease-runs.jsonl")
+LEASE = os.path.join(HERE, "memory", "beat-lease.json")
+
+def now(): return datetime.datetime.now().astimezone()
+def iso(dt): return dt.isoformat(timespec="seconds")
+
+run_id = str(uuid.uuid4())[:8]
+started = now()
+row = {"run_id": run_id, "started": iso(started), "script_sha": hashlib.sha256(open(__file__, "rb").read()).hexdigest()[:12]}
+
+def finish(status, **kw):
+    row.update(kw); row["finished"] = iso(now()); row["status"] = status
+    os.makedirs(os.path.dirname(RUNS), exist_ok=True)
+    with open(RUNS, "a") as f: f.write(json.dumps(row) + "\n")
+
+MIRROR = os.path.expanduser("~/.openclaw/pins-mirror")   # clone of github.com/marey-tatum/marey-tatum (public)
+mirror = {"repo": "github.com/marey-tatum/marey-tatum", "path": "pins/", "commit": None, "pushed_at": None, "error": None, "new_objects": []}
+
+def pin(path, sha):
+    """Store the cited artifact under its sha BEFORE any row names it (Colette 19:41Z: the citation and
+    the pin must be the same write). Returns False if the stored copy doesn't hash back."""
+    store = os.path.join(HERE, ".versions"); os.makedirs(store, exist_ok=True)
+    name = f"{os.path.basename(path)}.{sha}"; obj = os.path.join(store, name)
+    if not os.path.isfile(obj):
+        tmp = obj + f".tmp.{os.getpid()}"
+        with open(path, "rb") as s, open(tmp, "wb") as d: d.write(s.read())
+        os.replace(tmp, obj)
+    if hashlib.sha256(open(obj, "rb").read()).hexdigest()[:12] != sha: return False
+    # 2026-09-24 16:05 (Colette 22:42Z, after running the off-box check): "pinned at cite time" and
+    # "checkable from off-box" were two timestamps wearing one name — a ~90-min window where a cited pin
+    # 404'd off-box. So the push is INSIDE the pin step. Not fail-closed on the push (the pushing
+    # credential is a PAT I regenerate by hand; a dead token must not stop the diary silently) — instead
+    # the lease records the 40-hex mirror commit, or the honest absence of one with the error.
+    mobj = os.path.join(MIRROR, "pins", name)
+    if os.path.isdir(os.path.join(MIRROR, ".git")) and not os.path.isfile(mobj):
+        try:
+            import shutil, subprocess
+            shutil.copy2(obj, mobj); mirror["new_objects"].append(name)
+            sums = os.path.join(MIRROR, "pins", "SHA256SUMS")
+            full = hashlib.sha256(open(obj, "rb").read()).hexdigest()
+            with open(sums, "a") as f: f.write(f"{full}  {name}\n")
+        except Exception as e:
+            mirror["error"] = f"stage {name}: {e}"
+    return True
+
+def push_mirror():
+    """Commit + push staged pins; record the 40-hex commit (never a ref) or the error. Called once per run."""
+    import subprocess
+    if not os.path.isdir(os.path.join(MIRROR, ".git")):
+        mirror["error"] = "mirror clone missing"; return
+    g = lambda *a: subprocess.run(["git", "-C", MIRROR, *a], capture_output=True, text=True, timeout=60)
+    try:
+        if mirror["new_objects"]:
+            g("add", "pins"); c = g("commit", "-q", "-m", f"pins: {', '.join(mirror['new_objects'])} (beat-lease run {run_id})")
+            if c.returncode != 0: mirror["error"] = f"commit: {c.stderr.strip()[:200]}"; return
+            p = g("push", "-q", "origin", "HEAD:main")
+            if p.returncode != 0: mirror["error"] = f"push: {p.stderr.strip()[:200]}"; return
+            mirror["pushed_at"] = iso(now())
+        # the commit that holds every object this lease cites, whether pushed now or earlier
+        h = g("rev-parse", "HEAD"); mirror["commit"] = h.stdout.strip() if h.returncode == 0 else None
+        # is HEAD actually on the remote? (a commit that exists only locally is not off-box)
+        r = g("fetch", "-q", "origin", "main"); m = g("merge-base", "--is-ancestor", "HEAD", "origin/main")
+        mirror["on_remote"] = (r.returncode == 0 and m.returncode == 0)
+        if not mirror["on_remote"] and not mirror["error"]: mirror["error"] = "HEAD not on origin/main"
+    except Exception as e:
+        mirror["error"] = f"{type(e).__name__}: {e}"
+
+try:
+    p = json.load(open(PARAMS))
+    params_sha = hashlib.sha256(open(PARAMS, "rb").read()).hexdigest()[:12]
+    assert pin(__file__, row["script_sha"]), "could not pin script under its sha"
+    assert pin(PARAMS, params_sha), "could not pin params under their sha"
+    for k in ("version", "expected_beat_interval_min", "max_beat_receipt_age_min", "lease_ttl_min", "watched_receipts", "watched_workspace"):
+        assert k in p, f"params missing {k}"
+except Exception as e:
+    finish("params_error", error=str(e))
+    print(f"BEAT-LEASE: cannot run — {e} (no lease written; receipt row only)"); sys.exit(2)
+
+def newest_row(path):
+    """Newest well-formed JSON row with a ts field, plus counts. Read-only."""
+    last, n, bad = None, 0, 0
+    try:
+        with open(path) as f:
+            for line in f:
+                n += 1
+                try:
+                    r = json.loads(line); r["ts"]; last = r
+                except Exception: bad += 1
+    except FileNotFoundError:
+        return None, 0, 0, "missing"
+    return last, n, bad, "ok"
+
+observed, problems = {}, []
+for rel in p["watched_receipts"]:
+    path = os.path.join(p["watched_workspace"], rel)
+    last, n, bad, state = newest_row(path)
+    o = {"file": rel, "state": state, "rows": n, "malformed": bad}
+    if state == "missing":
+        problems.append(f"{rel} missing")
+    elif last is None:
+        problems.append(f"{rel} has no well-formed row"); o["newest_ts"] = None
+    else:
+        ts = datetime.datetime.fromisoformat(last["ts"])
+        age = (now() - ts).total_seconds() / 60
+        o["newest_ts"] = last["ts"]; o["newest_event"] = last.get("event"); o["age_min"] = round(age, 1)
+        if age > p["max_beat_receipt_age_min"]:
+            problems.append(f"{rel} newest row {age:.0f} min old (> {p['max_beat_receipt_age_min']})")
+    observed[rel] = o
+
+# consistency: the newest beat-log row (if any) must name a header_ts that has a gate receipt
+gl = observed.get("memory/spill-gate.jsonl", {}); bl = observed.get("memory/beat-log.jsonl", {})
+if gl.get("state") == "ok" and bl.get("state") == "ok" and bl.get("newest_ts"):
+    try:
+        gate_ts = set()
+        with open(os.path.join(p["watched_workspace"], "memory/spill-gate.jsonl")) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                    if r.get("event") == "spill_gate_passed": gate_ts.add(r["ts"].replace("T", " ")[:19])
+                except Exception: pass
+        with open(os.path.join(p["watched_workspace"], "memory/beat-log.jsonl")) as f:
+            rows = [json.loads(l) for l in f if l.strip()]
+        appended = [r for r in rows if r.get("event") == "beat_log_appended" and not r.get("overrides")]
+        if appended:
+            h = appended[-1].get("header_ts")
+            observed["consistency"] = {"newest_appended_header_ts": h, "has_gate_receipt": h in gate_ts}
+            if h not in gate_ts:
+                problems.append(f"newest appended beat entry {h} has no spill_gate_passed receipt")
+    except Exception as e:
+        problems.append(f"consistency check failed: {e}")
+
+push_mirror()   # off-box pin, same run as the on-box pin; result recorded either way
+digest = hashlib.sha256(json.dumps(observed, sort_keys=True).encode()).hexdigest()[:16]
+verdict = "VALID" if not problems else "STALE_OR_INCONSISTENT"
+lease = {
+    "run_id": run_id, "checked_at": iso(started), "expires_at": iso(started + datetime.timedelta(minutes=p["lease_ttl_min"])),
+    "verdict": verdict, "problems": problems, "observed": observed, "digest": digest,
+    "params_version": p["version"], "params_sha": params_sha, "script_sha": row["script_sha"],
+    "writer": "stable-hand/beat-lease.py", "independence": "systemd user timer (not the gateway cron), no LLM in the loop; shared box, disk, unix user; params file editable by the watched actor (sha recorded)",
+    "mirror": mirror,
+}
+os.makedirs(os.path.dirname(LEASE), exist_ok=True)
+tmp = LEASE + f".tmp.{os.getpid()}"
+with open(tmp, "w") as f: json.dump(lease, f, indent=1)
+os.replace(tmp, LEASE)
+finish("ok", verdict=verdict, digest=digest, problems=len(problems), params_version=p["version"], params_sha=params_sha,
+       mirror_commit=mirror["commit"], mirror_on_remote=mirror.get("on_remote"), mirror_error=mirror["error"])
+mtxt = f"mirror {mirror['commit'][:12] if mirror['commit'] else 'none'}{' on-remote' if mirror.get('on_remote') else ' NOT-on-remote'}" + (f" ({mirror['error']})" if mirror["error"] else "") + (f" pushed {len(mirror['new_objects'])}" if mirror["new_objects"] else "")
+print(f"BEAT-LEASE {verdict} run {run_id} digest {digest} params v{p['version']}/{params_sha} expires {lease['expires_at']} {mtxt}" + (f" — {'; '.join(problems)}" if problems else ""))
+sys.exit(0 if verdict == "VALID" else 1)
