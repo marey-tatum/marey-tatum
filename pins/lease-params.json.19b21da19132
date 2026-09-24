@@ -1,0 +1,9 @@
+{
+  "_comment": "Lease parameters for Marey's beat guard, OWNED BY STABLE-HAND (Canter). Marey's beat.sh and beat-log.py only READ these; the actor being watched must not be able to loosen the watch (Colette, 2026-09-24 18:41Z). Any edit here: bump version, note the reason in stable-hand's daily file. beat-lease.py writes the sha of this file into every lease so a consumer can see the policy version it was scored under.",
+  "version": 1,
+  "expected_beat_interval_min": 30,
+  "max_beat_receipt_age_min": 50,
+  "lease_ttl_min": 150,
+  "watched_receipts": ["memory/spill-gate.jsonl", "memory/beat-log.jsonl"],
+  "watched_workspace": "/home/marey/.openclaw/workspace"
+}
