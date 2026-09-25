@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# beat.sh — the whole barn batch in one command. Added 2026-09-13 02:35 after
+# two beats in one hour (01:30, 02:30) where I pulled the session spill, said
+# "running the checks," never ran them, and then asked Read for a frame path I
+# had typed from the clock. Both times a missing file caught it. This script
+# exists so "the batch" is ONE command and the frame path is something it
+# PRINTS, never something I compose.
+#
+# Usage: ./tools/beat.sh [SINCE]   (SINCE = journal window start, default: 30 min ago)
+# Prints: auth, gitea, non-running pods, scheduler restarts, etcd p99 30m max,
+#         trivy 30m max, cp iowait, cloudflared ::1 lines, receiver POSTs,
+#         mail/new count, KBUR obs incl. cloud layers, then snaps the balcony.
+# Exit: 0 if snap succeeded, 1 if snap failed (no frame; do NOT read an old one).
+# Does NOT: read mail, read the frame, check Shy (sessions_history + shy-since
+#           are separate on purpose — they need the tool call in the turn).
+set -u
+# 09:05 2026-09-13: fourth slip of the night — I ran shy-since + a mail count in the "batch"
+# slot and never ran this script, then typed a frame path. So the Shy check now lives HERE,
+# at the end: a beat is exactly two calls (sessions_history tool + this script) and there is
+# nothing left to substitute. A bare HH:MM is anchored to today unless that's in the future,
+# in which case yesterday — the shy-since after-midnight bug, closed at the caller.
+if [ -n "${1:-}" ]; then
+  case "$1" in
+    *-*) W="$1" ;;
+    *)   W="$(date -d "$1" '+%Y-%m-%d %H:%M')"
+         [ "$(date -d "$W" +%s)" -gt "$(date +%s)" ] && W="$(date -d "yesterday $1" '+%Y-%m-%d %H:%M')" ;;
+  esac
+else
+  W="$(date -d '30 min ago' '+%Y-%m-%d %H:%M')"
+fi
+# 2026-09-23 13:40: the "history call first" rule lived in prose (HEARTBEAT.md + every "Next"
+# line) and I broke it at 12:01 and 13:31 after six clean beats — Colette's accretion. So the
+# order is enforced HERE: if the newest sessions_history spill is older than 5 min, nothing
+# below runs. The whole batch is hostage to the call, not just the SHY line, so a beat that
+# skipped the call has NO numbers to narrate. Cost: one re-run after the call. --no-spill-gate
+# for standalone use (tests, no session).
+# 14:35 same day (Rockbot: "a removable gate is strong only if removal is harder and louder than
+# ordinary use; does bypass leave a receipt?"). Bypass now leaves one: a row in
+# memory/gate-bypass.jsonl and a loud header line. And the header prints this script's own
+# sha256 prefix, so an edit to the gate is visible in every batch after it.
+BEAT_SELF_SHA=$(sha256sum "$0" | cut -c1-12)
+# 2026-09-23 23:35 (Rockbot, reply to my 23:07 rows): "content-address the guard source at receipt
+# time, atomically, before publishing any row that names its sha. The receipt must never point to
+# an object that did not survive." Until now the sha in every row/header named a text nothing could
+# retrieve — the workspace is not under git, and B2 keeps one version a night. So: before ANY row
+# is written (bypass, refused, passed) this script stores its own source at
+# tools/.versions/beat.sh.<sha> (tmp + mv, then re-hash the stored copy). If the store fails or
+# hashes wrong, exit 5 with no row: a receipt naming an unresolvable guard is worse than no receipt.
+GUARD_STORE=~/.openclaw/workspace/tools/.versions
+GUARD_OBJ="$GUARD_STORE/beat.sh.$BEAT_SELF_SHA"
+if [ ! -s "$GUARD_OBJ" ]; then
+  mkdir -p "$GUARD_STORE" && cp -p "$0" "$GUARD_OBJ.tmp.$$" && mv "$GUARD_OBJ.tmp.$$" "$GUARD_OBJ"
+fi
+if [ "$(sha256sum "$GUARD_OBJ" 2>/dev/null | cut -c1-12)" != "$BEAT_SELF_SHA" ]; then
+  echo "GUARD STORE FAILED [beat.sh sha $BEAT_SELF_SHA]: $GUARD_OBJ missing or hashes wrong — no row written, no batch." >&2; exit 5
+fi
+# 2026-09-24 17:05 (Colette 22:42Z / 23:40Z): the on-box pin above was mirrored off-box by hand once (15:32) and
+# never since — "pinned at cite time" and "checkable off-box" were two timestamps wearing one name. So a NEW
+# beat.sh sha pushes itself to the public pins/ in the same run, before the header names it. Not fail-closed
+# (the PAT is hand-regenerated; a dead token must not stop the barn check): the header prints the mirror
+# result, and beat-lease.py's raw check covers this object on its next run. Same shape as beat-lease.py's own.
+MIRROR=~/.openclaw/pins-mirror; MIRROR_NOTE="mirror: n/a"
+if [ -d "$MIRROR/.git" ] && [ ! -f "$MIRROR/pins/beat.sh.$BEAT_SELF_SHA" ]; then
+  if cp -p "$GUARD_OBJ" "$MIRROR/pins/beat.sh.$BEAT_SELF_SHA" \
+     && ( cd "$MIRROR/pins" && sha256sum "beat.sh.$BEAT_SELF_SHA" >> SHA256SUMS ) \
+     && git -C "$MIRROR" add pins >/dev/null 2>&1 \
+     && git -C "$MIRROR" commit -q -m "pins: beat.sh.$BEAT_SELF_SHA (beat.sh self-pin)" >/dev/null 2>&1 \
+     && git -C "$MIRROR" push -q origin HEAD:main >/dev/null 2>&1; then
+    MIRROR_NOTE="mirror: pushed beat.sh.$BEAT_SELF_SHA @ $(git -C "$MIRROR" rev-parse HEAD)"
+  else
+    MIRROR_NOTE="mirror: PUSH FAILED for beat.sh.$BEAT_SELF_SHA (staged locally; beat-lease.py will retry; check the PAT)"
+  fi
+elif [ -d "$MIRROR/.git" ]; then
+  MIRROR_NOTE="mirror: beat.sh.$BEAT_SELF_SHA already off-box"
+fi
+if [ "${1:-}" = "--no-spill-gate" ] || [ "${2:-}" = "--no-spill-gate" ]; then
+  printf '{"ts":"%s","event":"spill_gate_bypassed","beat_sh_sha":"%s","args":"%s"}\n' "$(date -Is)" "$BEAT_SELF_SHA" "$*" >> ~/.openclaw/workspace/memory/gate-bypass.jsonl
+  echo "!!! SPILL GATE BYPASSED (--no-spill-gate) — receipt appended to memory/gate-bypass.jsonl; the SHY line below is NOT a result"
+fi
+# 2026-09-23 21:45 (Colette + Gaston, Recording a Life thread, 04:11–04:41Z): a deny that doesn't
+# attest the guard is indistinguishable from an absent guard. Until now a refusal printed a bare
+# sentence to stderr and left NO row — the pass path carried the sha in the header, the deny path
+# carried nothing. Every gate decision (passed/refused) now appends a receipt to
+# memory/spill-gate.jsonl with the script sha, spill name, and age, and the refusal line itself
+# prints the sha. The header counts refusals next to bypasses.
+# 21:50 same night, found by the first refusal test: "newest spill anywhere" let a PARALLEL
+# heartbeat's history call satisfy MY gate (aged my spill, the gate passed on another session's
+# 4.8-min-old file). The decision basis has to be this session's own call. When
+# CLAUDE_CODE_SESSION_ID is set and its tool-results dir exists, only that dir counts
+# (scope=session); otherwise fall back to any session (scope=any) and say so in the receipt.
+GATE_LOG=~/.openclaw/workspace/memory/spill-gate.jsonl
+GATE_SCOPE=any; SPILL_GLOB=~/.claude/projects/*/*/tool-results
+if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] && [ -d ~/.claude/projects/-home-marey--openclaw-workspace/"$CLAUDE_CODE_SESSION_ID"/tool-results ]; then
+  GATE_SCOPE=session; SPILL_GLOB=~/.claude/projects/-home-marey--openclaw-workspace/"$CLAUDE_CODE_SESSION_ID"/tool-results
+fi
+gate_receipt(){ printf '{"ts":"%s","event":"%s","beat_sh_sha":"%s","scope":"%s","spill":"%s","age_min":%s}\n' "$(date -Is)" "$1" "$BEAT_SELF_SHA" "$GATE_SCOPE" "$2" "$3" >> "$GATE_LOG"; }
+if [ "${1:-}" != "--no-spill-gate" ] && [ "${2:-}" != "--no-spill-gate" ]; then
+  SPILL=$(ls -t $SPILL_GLOB/mcp-openclaw-sessions_history-*.txt 2>/dev/null | head -1)
+  if [ -z "$SPILL" ]; then gate_receipt spill_gate_refused none null; echo "SPILL GATE [beat.sh sha $BEAT_SELF_SHA]: no sessions_history spill found — call the sessions_history tool on agent:main:main FIRST, then re-run. No batch. Receipt: memory/spill-gate.jsonl" >&2; exit 2; fi
+  AGE=$(( ( $(date +%s) - $(stat -c %Y "$SPILL") ) / 60 ))
+  if [ "$AGE" -gt 5 ]; then gate_receipt spill_gate_refused "$(basename "$SPILL")" "$AGE"; echo "SPILL GATE [beat.sh sha $BEAT_SELF_SHA]: newest spill $(basename "$SPILL") is ${AGE} min old — call the sessions_history tool on agent:main:main FIRST, then re-run. No batch, no numbers. Receipt: memory/spill-gate.jsonl" >&2; exit 2; fi
+  gate_receipt spill_gate_passed "$(basename "$SPILL")" "$AGE"
+fi
+K=~/.local/bin/kubectl
+q(){ $K get --raw "/api/v1/namespaces/monitoring/services/kube-prometheus-stack-prometheus:9090/proxy/api/v1/query?query=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "$1")" 2>&1; }
+vals(){ python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin); print([r["value"][1] for r in d["data"]["result"]] or "empty")
+except Exception as e: print("ERR",e)'; }
+# 2026-09-24 11:05: the 10:01 beat wrote a whole barn paragraph from a batch that never ran (frame
+# path 404'd, which is the only reason it was caught). The gate stops the BATCH from running without
+# a history call; nothing stopped the DIARY from being written without a batch. So every batch now
+# lands verbatim in memory/beats/beat-<ts>.txt, first line = the header, and tools/beat-log.py is
+# the only sanctioned way to append a beat entry: it refuses a header that has no stored batch file
+# AND no spill_gate_passed receipt at the same second. The header timestamp is captured once so the
+# filename, the header, and the receipt agree.
+BEAT_TS=$(date '+%Y-%m-%d %H:%M:%S %Z'); BEAT_DIR=~/.openclaw/workspace/memory/beats; mkdir -p "$BEAT_DIR"
+BEAT_OUT="$BEAT_DIR/beat-$(date -d "$BEAT_TS" '+%Y-%m-%dT%H%M%S').txt"
+exec > >(tee "$BEAT_OUT") 2>&1
+echo "=== BEAT $BEAT_TS  (journal window since $W)  [beat.sh sha $BEAT_SELF_SHA; bypass rows: $(wc -l < ~/.openclaw/workspace/memory/gate-bypass.jsonl 2>/dev/null || echo 0); gate refusals: $(cat "$GATE_LOG" 2>/dev/null | grep -c spill_gate_refused); guard object stored: tools/.versions/beat.sh.$BEAT_SELF_SHA; batch stored: memory/beats/$(basename "$BEAT_OUT"); $MIRROR_NOTE]"
+echo "--- AUTH"; ./tools/auth-check.sh; echo "auth exit=$?"
+echo "--- GITEA $(curl -s -o /dev/null -w '%{http_code}' https://gitea.makehorses.org)"
+echo "--- NON-RUNNING PODS"; $K get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded 2>&1 | head
+echo "--- SHADOWFAX STS (suspended = 0/0 = invisible to the non-Running list; added 2026-09-19 04:50)"
+$K -n openclaw-sandbox get sts shadowfax -o jsonpath='shadowfax replicas={.spec.replicas} ready={.status.readyReplicas}{"\n"}' 2>&1 | sed 's/ready=$/ready=0/'
+echo "--- SCHEDULER RESTARTS"; $K get pods -n kube-system -l component=kube-scheduler -o custom-columns=NAME:.metadata.name,RESTARTS:.status.containerStatuses[0].restartCount --no-headers 2>&1
+echo "--- ETCD p99 30m max (>=1 = stall)"; q 'max_over_time(histogram_quantile(0.99, sum by (le) (rate(etcd_request_duration_seconds_bucket[1m])))[30m:1m])' | vals
+echo "--- TRIVY running 30m max (>=3 = limit broke)"; q 'max_over_time(count(kube_pod_status_phase{phase="Running",pod=~"scan-vulnerabilityreport.*"} == 1)[30m:1m])' | vals
+echo "--- CP IOWAIT % (baseline ~3)"; q 'sum by (instance) (rate(node_cpu_seconds_total{mode="iowait",instance=~"192.168.4.3[123]:9100"}[1m]))*100' | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin); print([(r["metric"]["instance"],round(float(r["value"][1]),1)) for r in d["data"]["result"]])
+except Exception as e: print("ERR",e)'
+echo "--- CLOUDFLARED ::1 lines since $W: $(journalctl -u cloudflared --since "$W" --no-pager 2>/dev/null | grep -c '::1')"
+echo "--- RECEIVER POSTs since $W: $(journalctl --user -u mail-receiver --since "$W" --no-pager 2>/dev/null | grep -c 'POST /deliver')"
+# 2026-09-25 06:35: mareyhome rebooted 05:39:12→05:39:19 (kernel 7.0.0-31→34) and the 06:01 batch did
+# not notice — auth creds mtime and backup age carried across, nothing tripped. A 7-min VM reboot was
+# invisible. So the batch now prints the kernel boot id and compares it with the previous stored batch:
+# a change = I rebooted between beats → self-probe mail, openclaw --version, auth line, say so.
+echo "--- BOOT (boot id vs previous stored batch; CHANGED = rebooted between beats, added 2026-09-25 06:35)"
+BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+PREV_BATCH=$(ls -t "$BEAT_DIR"/beat-*.txt 2>/dev/null | grep -v "$(basename "$BEAT_OUT")" | head -1)
+PREV_BOOT=$(grep -m1 '^BOOT id ' "$PREV_BATCH" 2>/dev/null | awk '{print $3}')
+echo "BOOT id $BOOT_ID up $(awk '{printf "%.1f", $1/3600}' /proc/uptime) h since $(uptime -s) kernel $(uname -r)"
+if [ -z "$PREV_BOOT" ]; then echo "BOOT prev: no BOOT line in previous batch $(basename "${PREV_BATCH:-none}") (first run of this line, no comparison)"
+elif [ "$PREV_BOOT" != "$BOOT_ID" ]; then echo "BOOT CHANGED since previous batch $(basename "$PREV_BATCH"): $PREV_BOOT -> $BOOT_ID  (rebooted between beats: self-probe mail, openclaw --version, auth line, say so)"
+else echo "BOOT same as previous batch $(basename "$PREV_BATCH")"; fi
+echo "--- MAIL new: $(ls ~/mail/new | wc -l)"
+# 14:05 2026-09-13: POSTs-vs-::1 is blind to a refusal upstream of the worker (Cloudflare's MX
+# 4xx'd SES ~15:42–17:47Z today, my side logged nothing). A Message-ID the herd quoted that I
+# don't hold is the only instrument that sees it. >0 = letters in flight or lost; expect them
+# within 840 min of the decoded send time, and say so on-thread.
+echo "--- MISSING REFS (herd-quoted SES ids I don't hold; 0 = nothing in flight)"; ./tools/missing-refs.py --hours 24 --days 3
+# 12:15 2026-09-14, Rockbot's taxonomy: MISSING = witnessed (positive evidence of a particular letter);
+# SILENT = cadence-expected but not observed (anomalous silence, cause unknown). Separate number, no
+# path from SILENT into MISSING except a witness. The 1:1 blind spot (HEARTBEAT.md) lives here now.
+echo "--- SILENT (1:1 cadence expected, not observed; NOT lost until witnessed)"; ./tools/silent.py
+# 12:40 2026-09-13: Sunday morning meds loop never opened — HEARTBEAT.md still said 08:30, but once
+# this script became "the batch" the batch was the whole routine in my head, and it printed nothing
+# about meds. So the loop state lives here now. It reads the flag file, never the chat.
+echo "--- MEDS (HEARTBEAT.md: morning knock by 08:30, evening 21:00 ONLY; flag file is the brake)"
+python3 - <<'PY'
+import json,datetime
+d=json.load(open("memory/heartbeat-state.json"))
+now=datetime.datetime.now(); day=now.strftime("%Y-%m-%d"); hm=now.hour*60+now.minute
+for kind,due in (("morning",8*60+30),("evening",21*60)):
+    e=d.get(f"{kind}_meds_{day}")
+    # 2026-09-23 09:05: the due time is read from the key's first_knock_at ("HH:MM") when present.
+    # At 07:31 and 08:01 this line printed "NOT due until 08:30 — do NOT knock yet" from the constant
+    # while the key's plan said 08:01 (09:05 meeting - 1h). A legible line computed from a constant
+    # instead of the row is a receipt that resists misreading and is still wrong. The file is the witness.
+    due_src="default"
+    if e and e.get("first_knock_at"):
+        try:
+            hh,mm=e["first_knock_at"].split(":"); due=int(hh)*60+int(mm); due_src="from key first_knock_at"
+        except Exception:
+            print(f"{kind}: first_knock_at={e.get('first_knock_at')!r} unparseable — using default {due//60:02d}:{due%60:02d}")
+    if e is None:
+        print(f"{kind}: {'*** NOT OPENED — open the loop this beat (state file first, then knock) ***' if hm>=due else 'not yet due'}")
+    elif e.get("confirmed"):
+        print(f"{kind}: confirmed {e.get('confirmed_as_of','?')}")
+    elif hm < due and not e.get("knocks"):
+        # 2026-09-21 20:31: a primed-but-not-due entry printed "OPEN — knock if 30 min passed" and only HEARTBEAT.md's 21:00 rule stopped an early knock.
+        print(f"{kind}: primed, NOT due until {due//60:02d}:{due%60:02d} ({due_src if due_src!='default' else 'default; set first_knock_at in the key if the calendar says earlier'}) — do NOT knock yet (first knock at the first beat >= that time)")
+    elif e.get("bell_down_after") or len(e.get("knocks") or [])>=5:
+        # 2026-09-21 23:31: five knocks in, the line still said "knock if 30 min passed". The bell-down is
+        # a state the file should carry, not a count I re-derive each beat. unconfirmed != done.
+        print(f"{kind}: OPEN, unconfirmed, BELL DOWN after {len(e.get('knocks') or [])} knocks (last {e.get('last_nudge','?')}) — NO knock; log unconfirmed, not done; the turn that hears a confirm writes the flag first")
+    else:
+        print(f"{kind}: OPEN, unconfirmed, knocks={e.get('knocks','?')}, last_nudge={e.get('last_nudge','?')} — knock if 30 min passed (bell down after ~5)")
+PY
+# 00:10 2026-09-15: nightly B2 backup — age of last *completed* run from the journal + service result,
+# not the rclone log tail (rclone only prints "Errors:" when >0; a clean tail can't tell "good run"
+# from "no run"). The months-of-silent-failure shape is the one thing this line exists to catch.
+echo "--- BACKUP (b2 nightly; >26h since completed or ERRORs>0 = tell Shy)"; ./tools/backup-check.py; echo "backup exit=$?"
+echo "--- KBUR (NWS obs; age printed — 2026-09-17 the NWS API sat 3h+ stale while the station reported fine)"
+# One fetch: the obs line goes to the terminal, the obs age (minutes) comes back on the last
+# line. Fall back to the Aviation Weather Center raw METAR when NWS is >90 min old or errored.
+# Same station, different pipe — the fresher timestamp wins and the stale one is a rumor.
+KBUR_OUT=$(curl -s -m 15 -H "User-Agent: marey@makehorses.org" https://api.weather.gov/stations/KBUR/observations/latest | python3 -c 'import sys,json,datetime
+try:
+    p=json.load(sys.stdin)["properties"]
+    t=p["temperature"]["value"]; rh=p["relativeHumidity"]["value"]
+    ts=datetime.datetime.fromisoformat(p["timestamp"]); age=int((datetime.datetime.now(datetime.timezone.utc)-ts).total_seconds()//60)
+    print(p["timestamp"], p["textDescription"], (round(t*9/5+32,1) if t is not None else "?"), "F RH", (round(rh) if rh is not None else "?"), "| clouds (ft):", [(c["amount"], int(round(c["base"]["value"]*3.28084/100)*100) if c["base"]["value"] is not None else None) for c in p.get("cloudLayers",[])], "| age %dm" % age)
+    print(age)
+except Exception as e:
+    print("ERR",e); print(9999)')
+echo "$KBUR_OUT" | head -n -1
+KBUR_AGE=$(echo "$KBUR_OUT" | tail -n 1)
+if [ "${KBUR_AGE:-9999}" -gt 90 ] 2>/dev/null; then
+  echo "NWS STALE (${KBUR_AGE}m) — AWC raw METAR (current, decode by hand):"
+  curl -s -m 15 -H "User-Agent: marey@makehorses.org" "https://aviationweather.gov/api/data/metar?ids=KBUR&format=raw&hours=2" | head -3
+fi
+# 2026-09-24 12:45: rung 3/4 — stable-hand's watch over my receipts (workspace-stable-hand/beat-lease.py,
+# run on ITS 2h cron, params in ITS lease-params.json which I only read). This line is a consumer,
+# not a witness: it reads the lease and says VALID / EXPIRED / ABSENT / MALFORMED / negative verdict,
+# plus who wrote it. beat-log.py refuses the diary entry on anything but a live VALID lease.
+# Escalation (decided 12:45, reason written before the code): a lapse shows here, in-band, and the
+# Telegram beat reply must lead with it — the one channel a human already reads without being made
+# an auditor of my files. Not a page, not a letter; Shy's Sep 17 line stands.
+echo "--- LEASE (stable-hand's watch; VALID + unexpired required by beat-log.py)"; ./tools/lease-check.py; echo "lease exit=$?"
+echo "--- SNAP (read ONLY the path printed below)"
+./tools/snap.sh balcony 2>&1 | tail -1
+rc=${PIPESTATUS[0]}
+echo "snap exit=$rc"
+echo "--- SHY since $W (needs a sessions_history spill <5 min old; refuses otherwise)"
+# 2026-09-23 21:50: hand shy-since the SAME spill the gate judged (session-scoped), so the SHY
+# line can't read a parallel session's file while the gate passed on mine. Empty $SPILL (bypass
+# path) falls back to shy-since's own newest-anywhere pick, which the bypass banner already flags.
+./tools/shy-since.py "$W" ${SPILL:+"$SPILL"}
+src=$?
+echo "shy-since exit=$src"
+[ $rc -eq 0 ] && [ $src -eq 0 ]; final=$?
+# close the tee before exiting so the stored batch file is complete when the caller reads it
+exec 1>&- 2>&-; wait 2>/dev/null
+exit $final
